@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sample SAM Template for service_a
+
+Parameters:
+  ServiceAMaxRetries:
+    Type: Number
+    Default: "2"
+    Description: Maximum retries for the Service A
+
+Globals:
+  Function:
+    Timeout: 5
+
+Resources:
+  ServiceAFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./service_a/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      DeadLetterQueue:
+        TargetArn: !GetAtt ServiceADLQ.Arn
+        Type: SQS
+      Policies:
+        - CloudWatchLogsFullAccess
+        - DynamoDBReadPolicy:
+            TableName: !Ref CircuitBreakerStatusDynamoDBTable
+        - SQSPollerPolicy:
+            QueueName: 
+              !GetAtt ServiceARetrySQS.QueueName
+        - SQSSendMessagePolicy:
+            QueueName:
+              !GetAtt ServiceADLQ.QueueName
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ServiceARetrySQS.Arn
+            BatchSize: 1
+            Enabled: true
+
+  EventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ServiceAFunction
+      Qualifier: "$LATEST"
+      MaximumRetryAttempts: 0
+
+  ServiceADLQ:
+    Type: AWS::SQS::Queue
+
+  ServiceARetrySQS:
+    Type: AWS::SQS::Queue
+    Properties: 
+      RedrivePolicy: 
+        deadLetterTargetArn: !GetAtt ServiceADLQ.Arn
+        maxReceiveCount: 1
+
+  ServiceADLQHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./dlq_handler/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Environment:
+        Variables:
+          RETRY_QUEUE_URL: !Ref ServiceARetrySQS
+          MAX_RETRIES: !Ref ServiceAMaxRetries
+      Layers:
+        - !Ref ServiceADLQHandlerLayer
+      Policies:
+        - CloudWatchLogsFullAccess
+        - DynamoDBWritePolicy:
+            TableName: !Ref CircuitBreakerStatusDynamoDBTable
+        - SQSSendMessagePolicy:
+            QueueName:
+              !GetAtt ServiceARetrySQS.QueueName
+        - SQSPollerPolicy:
+            QueueName: 
+              !GetAtt ServiceADLQ.QueueName
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ServiceADLQ.Arn
+            BatchSize: 1
+            Enabled: true
+
+  ServiceADLQHandlerLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: dlq-helper-layer
+      Description: DLQ Helper Layer
+      ContentUri: './dlq_helper/'
+      CompatibleRuntimes:
+        - python3.8
+      RetentionPolicy: Delete
+
+  CircuitBreakerStatusDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CircuitBreakerStatus
+      KeySchema:
+        - AttributeName: ServiceName
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: ServiceName
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ExpireTimeStamp
+        Enabled: true
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+Outputs:
+  ServiceAFunction:
+    Description: "Service A Lambda Function ARN"
+    Value: !GetAtt ServiceAFunction.Arn
+  ServiceADLQHandlerFunction:
+    Description: "Service A DLQ Handler Lambda Function ARN"
+    Value: !GetAtt ServiceADLQHandlerFunction.Arn
+  ServiceAFunctionIamRole:
+    Description: "Implicit IAM Role created for Service A function"
+    Value: !GetAtt ServiceAFunctionRole.Arn
+  CircuitBreakerStatusDynamoDBTable:
+    Description: "DynamoDB Circuit Breaker Table"
+    Value: !GetAtt CircuitBreakerStatusDynamoDBTable.Arn
